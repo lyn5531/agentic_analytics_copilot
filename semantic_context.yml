@@ -1,0 +1,310 @@
+system:
+  name: Agentic Analytics Copilot
+  sql_dialect: PostgreSQL 13 compatible
+  database_engine: DuckDB
+  timezone: UTC+8
+  today: "2026-04-08"
+
+query_policy:
+  default_grain: day
+  read_only: true
+  allow_only_select: true
+  max_detail_rows: 500
+  default_limit_for_detail_queries: 500
+  forbid_select_star: true
+  prefer_aggregate_tables: true
+  require_explicit_time_range: true
+
+table_priority:
+  macro_metrics_queries:
+    preferred_table: agg_daily_metrics
+    description: >
+      For macro KPI, trend, date comparison, city/channel/device breakdown,
+      always prefer agg_daily_metrics first.
+  funnel_queries:
+    preferred_table: fact_events
+    description: >
+      For funnel analysis across view_product -> add_to_cart -> purchase,
+      use fact_events.
+  transaction_detail_queries:
+    preferred_table: fact_orders
+    description: >
+      Use fact_orders only when order-level or payment-specific detail is required.
+
+tables:
+  dim_users:
+    description: User dimension table for registration and user attributes.
+    primary_key: user_id
+    columns:
+      user_id: unique user identifier
+      register_date: user registration date
+      register_datetime: exact registration timestamp
+      country: country name
+      city: city name
+      region: business region
+      device_type: one of ios, android, web
+      acquisition_channel: first-touch acquisition channel
+      campaign_id: campaign identifier
+      user_segment: user segment label
+      is_premium: premium membership flag
+
+  fact_events:
+    description: User event fact table for behavioral analysis and funnel analysis.
+    primary_key: event_id
+    columns:
+      event_id: unique event identifier
+      user_id: user identifier
+      event_time: exact event timestamp
+      event_date: event date in UTC+8
+      event_name: behavior event name
+      session_id: session identifier
+      product_id: product identifier
+      category: product category
+      platform: app or web
+      device_type: device snapshot
+      country: country snapshot
+      city: city snapshot
+      acquisition_channel: channel snapshot
+      event_value: optional event value
+
+  fact_orders:
+    description: Order fact table for GMV, paid orders, purchasers, coupon usage.
+    primary_key: order_id
+    columns:
+      order_id: unique order identifier
+      user_id: user identifier
+      order_time: exact order timestamp
+      order_date: order date in UTC+8
+      amount: final paid amount
+      currency: currency code
+      status: order status
+      payment_method: payment method
+      coupon_used: whether a coupon was used
+      discount_amount: discount amount
+      product_category: product category
+      country: country snapshot
+      city: city snapshot
+      acquisition_channel: channel snapshot
+
+  agg_daily_metrics:
+    description: >
+      Daily aggregate KPI table. This is the default table for most MVP KPI queries.
+      Prefer this table whenever the user asks for yesterday, last week, last month,
+      city/channel/device trend, or KPI comparison.
+    primary_key: [metric_date, region, country, city, device_type, acquisition_channel]
+    columns:
+      metric_date: date of metric in UTC+8
+      region: business region
+      country: country
+      city: city
+      device_type: one of ios, android, web
+      acquisition_channel: one of facebook_ads, google_ads, organic, referral
+      new_users: daily new registered users
+      dau: daily active users
+      orders_paid: paid order count
+      purchasers: distinct users with paid orders
+      gmv: gross merchandise value from paid orders only
+      avg_order_value: gmv divided by orders_paid
+
+joins:
+  - left_table: fact_orders
+    left_key: user_id
+    right_table: dim_users
+    right_key: user_id
+    relationship: many_to_one
+    description: fact_orders joins dim_users on user_id
+
+  - left_table: fact_events
+    left_key: user_id
+    right_table: dim_users
+    right_key: user_id
+    relationship: many_to_one
+    description: fact_events joins dim_users on user_id
+
+dimensions:
+  region:
+    type: enum
+    allowed_values:
+      - North America
+      - APAC
+      - Europe
+
+  device_type:
+    type: enum
+    allowed_values:
+      - ios
+      - android
+      - web
+    anti_hallucination_notes:
+      - Always use lowercase values.
+      - Do not generate iOS, Android, Web in SQL filters.
+
+  acquisition_channel:
+    type: enum
+    allowed_values:
+      - facebook_ads
+      - google_ads
+      - organic
+      - referral
+    anti_hallucination_notes:
+      - Always use snake_case values.
+      - Do not convert facebook_ads into 'Facebook Ads' in SQL.
+
+  order_status:
+    type: enum
+    allowed_values:
+      - created
+      - paid
+      - cancelled
+      - refunded
+    meaning:
+      created: created but not yet paid
+      paid: paid successfully
+      cancelled: cancelled before payment completion
+      refunded: paid then refunded
+
+  event_name:
+    type: enum
+    allowed_values:
+      - app_open
+      - view_homepage
+      - view_product
+      - add_to_cart
+      - begin_checkout
+      - purchase
+
+metrics:
+  new_users:
+    label: 新增注册用户数
+    default_source_table: agg_daily_metrics
+    fallback_source_table: dim_users
+    definition: Distinct users registered successfully in the specified time range.
+    canonical_sql_logic: COUNT(DISTINCT user_id)
+    default_time_column: metric_date
+    supported_dimensions:
+      - region
+      - country
+      - city
+      - device_type
+      - acquisition_channel
+
+  dau:
+    label: 日活用户数
+    default_source_table: agg_daily_metrics
+    fallback_source_table: fact_events
+    definition: Distinct users who triggered at least one core event on a given day.
+    canonical_sql_logic: COUNT(DISTINCT user_id)
+    default_time_column: metric_date
+    core_events:
+      - app_open
+      - view_homepage
+      - view_product
+      - add_to_cart
+      - begin_checkout
+      - purchase
+    supported_dimensions:
+      - region
+      - country
+      - city
+      - device_type
+      - acquisition_channel
+
+  gmv:
+    label: 总GMV
+    default_source_table: agg_daily_metrics
+    fallback_source_table: fact_orders
+    definition: Sum of amount for paid orders only, excluding refunded orders.
+    canonical_sql_logic: SUM(amount) WHERE status = 'paid'
+    default_time_column: metric_date
+    supported_dimensions:
+      - region
+      - country
+      - city
+      - device_type
+      - acquisition_channel
+
+  orders_paid:
+    label: 已支付订单数
+    default_source_table: agg_daily_metrics
+    fallback_source_table: fact_orders
+    definition: Number of orders with status = 'paid'.
+    canonical_sql_logic: COUNT(order_id) WHERE status = 'paid'
+    default_time_column: metric_date
+    supported_dimensions:
+      - region
+      - country
+      - city
+      - acquisition_channel
+
+  purchasers:
+    label: 支付用户数
+    default_source_table: agg_daily_metrics
+    fallback_source_table: fact_orders
+    definition: Distinct users who placed at least one paid order.
+    canonical_sql_logic: COUNT(DISTINCT user_id) WHERE status = 'paid'
+    default_time_column: metric_date
+    supported_dimensions:
+      - region
+      - country
+      - city
+      - acquisition_channel
+
+  avg_order_value:
+    label: 客单价
+    default_source_table: agg_daily_metrics
+    fallback_source_logic: SUM(amount WHERE status='paid') / COUNT(order_id WHERE status='paid')
+    definition: Average order value for paid orders only.
+    default_time_column: metric_date
+    supported_dimensions:
+      - region
+      - country
+      - city
+      - acquisition_channel
+
+  funnel_conversion_rate:
+    label: 漏斗转化率
+    source_table: fact_events
+    definition: Distinct users in next stage divided by distinct users in previous stage.
+    default_funnel:
+      - view_product
+      - add_to_cart
+      - purchase
+    distinct_key: user_id
+    default_time_column: event_date
+
+time_rules:
+  timezone: UTC+8
+  hard_rules:
+    - Resolve all relative dates into explicit date literals before SQL generation.
+    - Prefer explicit dates like '2026-04-07' over NOW() or CURRENT_DATE.
+    - If the user asks about last week, convert it into a fixed date range first.
+    - Use DATE_TRUNC only when the user explicitly wants weekly or monthly grouping.
+  anti_hallucination_notes:
+    - Never assume timezone other than UTC+8.
+    - Never mix timestamp and date filters without clear casting.
+    - For date-based KPI queries, prefer metric_date from agg_daily_metrics.
+
+sql_constraints:
+  - Only generate SELECT statements.
+  - Never generate INSERT, UPDATE, DELETE, DROP, ALTER, CREATE.
+  - For macro KPI queries, use agg_daily_metrics first.
+  - For detail queries, add LIMIT 500.
+  - Never use SELECT *.
+  - Prefer aggregated outputs over raw detail rows.
+  - For funnel questions, use distinct user_id counts.
+  - For GMV, count only status = 'paid'.
+  - If required fields are missing in the chosen table, explain and fallback carefully.
+
+clarification_rules:
+  - Ask a follow-up question if time range is missing.
+  - Ask a follow-up question if the metric is ambiguous.
+  - Ask a follow-up question if the requested dimension is unclear.
+  - If the user requests unsupported advanced analysis, state MVP limitation clearly.
+
+anti_pitfall_guide:
+  - Do not use facebook_ads as 'Facebook Ads' in SQL.
+  - Do not count refunded orders into GMV.
+  - Do not use fact_events for simple daily KPI if agg_daily_metrics already contains it.
+  - Do not infer device_type from fact_orders unless explicitly present or semantically safe.
+  - Do not answer with fabricated numbers if SQL fails.
+  - If SQL execution fails, inspect the error and retry up to 3 times.
